@@ -128,8 +128,8 @@ def process_call(lead_id, act_id, file_id, call_date, phone, subject):
     row_id = save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript)
     log.info(f"Сохранено в БД id={row_id} | Лид #{lead_id} | {call_date}")
 
-    # Запускаем аудит конкретной записи в фоне (Project_11)
-    audit_script = "/home/vitaly/ALL_PROJECTS/Project_11/audit.py"
+    # Запускаем аудит конкретной записи в фоне (audit.py лежит рядом)
+    audit_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit.py")
     subprocess.Popen(
         ["python3", audit_script, "--id", str(row_id)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
