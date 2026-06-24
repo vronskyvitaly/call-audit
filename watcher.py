@@ -4,7 +4,7 @@ Bitrix24 отправляет событие ONVOXIMPLANTCALLEND → мы ска
 транскрибируем через Groq и сохраняем в Postgres.
 """
 
-import os, time, logging, requests, psycopg2
+import os, time, logging, requests, psycopg2, threading
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import groq as groq_sdk
@@ -131,10 +131,8 @@ def webhook():
     if event not in ("ONVOXIMPLANTCALLEND", "ONCRMACTIVITYADD"):
         return jsonify({"ok": True})
 
-    try:
-        process_event(data)
-    except Exception as e:
-        log.error(f"Ошибка обработки события: {e}", exc_info=True)
+    # Обрабатываем в фоне — сразу отвечаем Bitrix24 чтобы не получить retry
+    threading.Thread(target=process_event, args=(data,), daemon=True).start()
 
     return jsonify({"ok": True})
 
@@ -156,13 +154,20 @@ def process_event(data):
         log.warning("Нет lead_id в событии")
         return
 
-    # Небольшая пауза — запись появляется в Bitrix через несколько секунд
-    time.sleep(5)
+    # Ждём пока запись появится в Bitrix (загружается асинхронно, 30-120 сек)
+    time.sleep(60)
 
-    # Ищем активность с записью
-    act = find_recording_in_lead(lead_id)
+    # Ищем активность с записью — до 3 попыток с интервалом 60 сек
+    act = None
+    for attempt in range(3):
+        act = find_recording_in_lead(lead_id)
+        if act:
+            break
+        log.info(f"Лид {lead_id}: запись ещё не появилась, ждём ещё 60 сек (попытка {attempt+1}/3)")
+        time.sleep(60)
+
     if not act:
-        log.warning(f"Лид {lead_id}: звонков с записью не найдено")
+        log.warning(f"Лид {lead_id}: запись так и не появилась за 3 мин")
         return
 
     file_id   = act["FILES"][0]["id"]
