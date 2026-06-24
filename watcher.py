@@ -1,10 +1,11 @@
 """
-Webhook-сервер для мониторинга звонков Bitrix24.
-Bitrix24 отправляет событие ONVOXIMPLANTCALLEND → мы скачиваем запись,
-транскрибируем через Groq и сохраняем в Postgres.
+Webhook-сервер + polling для мониторинга звонков Bitrix24.
+Polling каждые 10 минут проверяет новые звонки у cargo-менеджеров.
+Webhook /webhook принимает события от Bitrix24 (резервный канал).
 """
 
 import os, time, logging, requests, psycopg2, threading
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import groq as groq_sdk
@@ -19,20 +20,23 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-BITRIX_BASE    = f"{os.getenv('BITRIX_PORTAL')}/rest/{os.getenv('BITRIX_USER_ID')}/{os.getenv('BITRIX_TOKEN')}"
-GROQ_KEY       = os.getenv("GROQ_API_KEY")
-DB_URL         = os.getenv("Postgres_URL")
-WEBHOOK_TOKEN  = os.getenv("BITRIX_WEBHOOK_TOKEN", "")
+BITRIX_BASE   = f"{os.getenv('BITRIX_PORTAL')}/rest/{os.getenv('BITRIX_USER_ID')}/{os.getenv('BITRIX_TOKEN')}"
+GROQ_KEY      = os.getenv("GROQ_API_KEY")
+DB_URL        = os.getenv("Postgres_URL")
+WEBHOOK_TOKEN = os.getenv("BITRIX_WEBHOOK_TOKEN", "")
 
-groq_client   = groq_sdk.Groq(api_key=GROQ_KEY)
+groq_client = groq_sdk.Groq(api_key=GROQ_KEY)
+
+# Cargo-менеджеры которых мониторим
+CARGO_MANAGERS = {
+    "Говорова":  int(os.getenv("BITRIX_ID_VICTORIA_GOVOROVA", 55)),
+    "Никитина":  int(os.getenv("BITRIX_ID_VICTORIA_NIKITINA", 53)),
+    "Батыгина":  int(os.getenv("BITRIX_ID_MARIA_BATYGINA", 83)),
+    "Михалина":  int(os.getenv("BITRIX_ID_EKATERINA_MIKHALINA", 51)),
+}
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def bitrix_get(method, params=""):
-    r = requests.get(f"{BITRIX_BASE}/{method}", params=dict(p.split("=", 1) for p in params.split("&") if "=" in p), timeout=15)
-    return r.json().get("result", {})
-
+# ── DB ─────────────────────────────────────────────────────────────────────────
 
 def get_db():
     return psycopg2.connect(DB_URL)
@@ -58,6 +62,13 @@ def ensure_table():
         conn.commit()
 
 
+def file_already_saved(file_id):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM call_transcripts WHERE file_id=%s", (file_id,))
+            return cur.fetchone() is not None
+
+
 def save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript):
     lead_url = f"{os.getenv('BITRIX_PORTAL')}/crm/lead/details/{lead_id}/" if lead_id else None
     with get_db() as conn:
@@ -65,30 +76,32 @@ def save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcr
             cur.execute("""
                 INSERT INTO call_transcripts
                     (lead_id, lead_url, bitrix_act_id, file_id, call_date, phone, subject, transcript_raw)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
             """, (lead_id, lead_url, act_id, file_id, call_date, phone, subject, transcript))
             row_id = cur.fetchone()[0]
         conn.commit()
     return row_id
 
 
+# ── Bitrix API ─────────────────────────────────────────────────────────────────
+
+def bitrix(method, params):
+    r = requests.get(f"{BITRIX_BASE}/{method}", params=params, timeout=20)
+    return r.json().get("result", {})
+
+
 def download_mp3(file_id):
-    """Получает свежий токен и скачивает MP3."""
-    file_info = bitrix_get("disk.file.get", f"id={file_id}")
-    url = file_info.get("DOWNLOAD_URL", "")
+    info = bitrix("disk.file.get", {"id": file_id})
+    url = info.get("DOWNLOAD_URL", "")
     if not url:
-        log.warning(f"Нет DOWNLOAD_URL для fileID={file_id}")
         return None
     r = requests.get(url, timeout=60)
     if r.status_code != 200 or len(r.content) < 5000:
-        log.warning(f"Не скачался fileID={file_id}: HTTP {r.status_code}, {len(r.content)} bytes")
         return None
     return r.content
 
 
 def transcribe(audio_bytes, filename="call.mp3"):
-    """Отправляет аудио в Groq Whisper, возвращает текст."""
     result = groq_client.audio.transcriptions.create(
         file=(filename, audio_bytes),
         model="whisper-large-v3-turbo",
@@ -98,43 +111,150 @@ def transcribe(audio_bytes, filename="call.mp3"):
     return str(result).strip()
 
 
-def find_recording_in_lead(lead_id):
-    """Ищет последний звонок с записью в лиде."""
-    acts = bitrix_get("crm.activity.list",
-        f"FILTER[OWNER_TYPE_ID]=1&FILTER[OWNER_ID]={lead_id}&FILTER[TYPE_ID]=2"
-        f"&SELECT[]=ID&SELECT[]=SUBJECT&SELECT[]=START_TIME&SELECT[]=FILES&ORDER[START_TIME]=DESC&LIMIT=3"
-    )
-    if not isinstance(acts, list):
-        return None
-    for act in acts:
-        files = act.get("FILES", [])
-        if files:
-            return act
-    return None
+def process_call(lead_id, act_id, file_id, call_date, phone, subject):
+    """Скачивает, транскрибирует и сохраняет один звонок."""
+    if file_already_saved(file_id):
+        return
+
+    audio = download_mp3(file_id)
+    if not audio:
+        log.warning(f"fileID={file_id}: не удалось скачать")
+        return
+
+    t0 = time.time()
+    transcript = transcribe(audio, f"{file_id}.mp3")
+    log.info(f"fileID={file_id}: {len(audio)//1024}KB → {len(transcript)} символов за {time.time()-t0:.1f}с")
+
+    row_id = save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript)
+    log.info(f"Сохранено в БД id={row_id} | Лид #{lead_id} | {call_date}")
 
 
-# ── Webhook endpoint ───────────────────────────────────────────────────────────
+# ── Polling ────────────────────────────────────────────────────────────────────
+
+def poll_new_calls():
+    """Проверяет новые звонки с записью за последние 15 минут у всех менеджеров."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S")
+    log.info(f"Polling: ищем звонки с {since}")
+
+    # Batch-запрос: лиды всех менеджеров одним вызовом
+    batch_cmd = {}
+    for name, uid in CARGO_MANAGERS.items():
+        batch_cmd[f"leads_{uid}"] = (
+            f"crm.lead.list?FILTER[ASSIGNED_BY_ID]={uid}"
+            f"&FILTER[>DATE_MODIFY]={since}&SELECT[]=ID&ORDER[ID]=DESC&LIMIT=10"
+        )
+
+    try:
+        r = requests.post(f"{BITRIX_BASE}/batch", json={"halt": 0, "cmd": batch_cmd}, timeout=30)
+        results = r.json().get("result", {}).get("result", {})
+    except Exception as e:
+        log.error(f"Polling batch ошибка: {e}")
+        return
+
+    lead_ids = []
+    for key, leads in results.items():
+        if isinstance(leads, list):
+            lead_ids.extend([l["ID"] for l in leads])
+
+    if not lead_ids:
+        log.info("Polling: новых лидов нет")
+        return
+
+    log.info(f"Polling: проверяем {len(lead_ids)} лидов")
+
+    # Batch: активности по всем найденным лидам
+    act_cmd = {}
+    for lid in lead_ids:
+        act_cmd[f"act_{lid}"] = (
+            f"crm.activity.list?FILTER[OWNER_TYPE_ID]=1&FILTER[OWNER_ID]={lid}"
+            f"&FILTER[TYPE_ID]=2&FILTER[>START_TIME]={since}"
+            f"&SELECT[]=ID&SELECT[]=START_TIME&SELECT[]=FILES&SELECT[]=SUBJECT&SELECT[]=COMMUNICATIONS"
+        )
+
+    try:
+        r = requests.post(f"{BITRIX_BASE}/batch", json={"halt": 0, "cmd": act_cmd}, timeout=30)
+        act_results = r.json().get("result", {}).get("result", {})
+    except Exception as e:
+        log.error(f"Polling activities ошибка: {e}")
+        return
+
+    for lid in lead_ids:
+        acts = act_results.get(f"act_{lid}", []) or []
+        for act in acts:
+            files = act.get("FILES", [])
+            if not files:
+                continue
+            file_id = files[0]["id"]
+            comms = act.get("COMMUNICATIONS", [])
+            phone = comms[0].get("VALUE", "") if comms else ""
+            threading.Thread(
+                target=process_call,
+                args=(lid, act["ID"], file_id, act.get("START_TIME"), phone, act.get("SUBJECT", "")),
+                daemon=True
+            ).start()
+
+
+def polling_loop():
+    """Фоновый поток: polling каждые 10 минут."""
+    while True:
+        try:
+            poll_new_calls()
+        except Exception as e:
+            log.error(f"Polling loop ошибка: {e}")
+        time.sleep(600)  # 10 минут
+
+
+# ── Webhook endpoint (резервный) ───────────────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.form.to_dict()
 
-    # Проверка токена Bitrix24
     if WEBHOOK_TOKEN and data.get("auth[application_token]") != WEBHOOK_TOKEN:
-        log.warning("Неверный токен webhook — запрос отклонён")
+        log.warning("Неверный токен webhook")
         return jsonify({"ok": False}), 403
 
     event = data.get("event", "")
-    log.info(f"Событие: {event} | данные: {list(data.keys())}")
+    log.info(f"Webhook: {event}")
 
-    # Событие окончания звонка
-    if event not in ("ONVOXIMPLANTCALLEND", "ONCRMACTIVITYADD"):
-        return jsonify({"ok": True})
-
-    # Обрабатываем в фоне — сразу отвечаем Bitrix24 чтобы не получить retry
-    threading.Thread(target=process_event, args=(data,), daemon=True).start()
+    if event in ("ONVOXIMPLANTCALLEND", "ONCRMACTIVITYADD"):
+        threading.Thread(target=process_webhook_event, args=(data,), daemon=True).start()
 
     return jsonify({"ok": True})
+
+
+def process_webhook_event(data):
+    lead_id = data.get("data[CRM_ENTITY_ID]") or data.get("data[LEAD_ID]")
+    phone   = data.get("data[PHONE_NUMBER]", "")
+    if not lead_id:
+        return
+    log.info(f"Webhook: лид={lead_id}, ждём 2 мин пока появится запись...")
+    time.sleep(120)
+    # После ожидания polling подберёт запись автоматически — или ищем явно
+    for attempt in range(5):
+        try:
+            acts = bitrix("crm.activity.list", {
+                "FILTER[OWNER_TYPE_ID]": 1, "FILTER[OWNER_ID]": lead_id,
+                "FILTER[TYPE_ID]": 2, "SELECT[]": ["ID","START_TIME","FILES","SUBJECT"],
+                "ORDER[START_TIME]": "DESC", "LIMIT": 3,
+            })
+            if isinstance(acts, list):
+                for act in acts:
+                    if act.get("FILES"):
+                        file_id = act["FILES"][0]["id"]
+                        process_call(lead_id, act["ID"], file_id, act.get("START_TIME"), phone, act.get("SUBJECT",""))
+                        return
+        except Exception as e:
+            log.warning(f"Webhook поиск записи попытка {attempt+1}: {e}")
+        time.sleep(90)
+    log.warning(f"Webhook: запись для лида {lead_id} не появилась")
+
+
+@app.route("/poll", methods=["GET", "POST"])
+def poll_now():
+    """Ручной запуск polling (для тестирования)."""
+    threading.Thread(target=poll_new_calls, daemon=True).start()
+    return jsonify({"ok": True, "message": "polling started"})
 
 
 @app.route("/health", methods=["GET"])
@@ -142,62 +262,17 @@ def health():
     return jsonify({"status": "ok"})
 
 
-def process_event(data):
-    # Из ONVOXIMPLANTCALLEND приходит CALL_ID и CRM_ENTITY_ID (лид)
-    lead_id  = data.get("data[CRM_ENTITY_ID]") or data.get("data[LEAD_ID]")
-    call_id  = data.get("data[CALL_ID]", "")
-    phone    = data.get("data[PHONE_NUMBER]", "")
-
-    log.info(f"Лид={lead_id} | phone={phone} | call_id={call_id}")
-
-    if not lead_id:
-        log.warning("Нет lead_id в событии")
-        return
-
-    # Ждём пока запись появится в Bitrix (загружается асинхронно, может занять несколько минут)
-    log.info(f"Лид {lead_id}: ждём 2 мин пока запись загрузится в Bitrix...")
-    time.sleep(120)
-
-    # Ищем активность с записью — до 5 попыток с интервалом 90 сек (итого до ~9.5 мин)
-    act = None
-    for attempt in range(5):
-        act = find_recording_in_lead(lead_id)
-        if act:
-            break
-        log.info(f"Лид {lead_id}: запись ещё не появилась, ждём 90 сек (попытка {attempt+1}/5)")
-        time.sleep(90)
-
-    if not act:
-        log.warning(f"Лид {lead_id}: запись не появилась за ~9.5 мин — пропускаем")
-        return
-
-    file_id   = act["FILES"][0]["id"]
-    act_id    = act["ID"]
-    subject   = act.get("SUBJECT", "")
-    call_date = act.get("START_TIME", "")
-
-    log.info(f"Скачиваю fileID={file_id}...")
-    audio = download_mp3(file_id)
-    if not audio:
-        return
-
-    log.info(f"Транскрибирую {len(audio)//1024}KB через Groq...")
-    t0 = time.time()
-    transcript = transcribe(audio)
-    elapsed = time.time() - t0
-    log.info(f"Готово за {elapsed:.1f}с: {len(transcript)} символов")
-
-    row_id = save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript)
-    log.info(f"Сохранено в БД: id={row_id} | Лид #{lead_id}")
-
-
 # ── Запуск ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
         ensure_table()
-        log.info("БД: таблица call_transcripts готова")
+        log.info("БД готова")
     except Exception as e:
-        log.error(f"Не удалось подключиться к БД при старте: {e}")
-    log.info("Сервер запущен. Ожидаю webhook от Bitrix24...")
+        log.error(f"Ошибка БД при старте: {e}")
+
+    # Запускаем polling в фоне
+    threading.Thread(target=polling_loop, daemon=True).start()
+    log.info("Polling запущен (каждые 10 мин). Сервер слушает webhook...")
+
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
