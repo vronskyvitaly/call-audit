@@ -16,7 +16,7 @@ CLAUDE_MODEL  = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 TG_TOKEN      = os.getenv("TG_BOT_TOKEN_AUDIT")
 # Получатели отчётов: разработчик + Александр (руководитель)
 # Александр должен написать /start боту @ROYALAGENT011_bot прежде чем начнёт получать сообщения
-TG_RECIPIENTS = ["8055160350", "1343266643"]
+TG_RECIPIENTS = ["8055160350", "1343266643", "5602533893"]
 BITRIX_PORTAL = os.getenv("BITRIX_PORTAL", "https://royalcargo.bitrix24.ru")
 
 MSK = timezone(timedelta(hours=3))
