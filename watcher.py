@@ -142,8 +142,8 @@ def process_call(lead_id, act_id, file_id, call_date, phone, subject):
 # ── Polling ────────────────────────────────────────────────────────────────────
 
 def poll_new_calls():
-    """Проверяет новые звонки с записью за последние 15 минут у всех менеджеров + необработанные лиды."""
-    since = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S")
+    """Проверяет новые звонки за последние 60 минут — перекрывает рестарты контейнера."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%S")
     log.info(f"Polling: ищем звонки с {since}")
 
     # Batch-запрос: лиды менеджеров + необработанные (STATUS_ID=NEW)
