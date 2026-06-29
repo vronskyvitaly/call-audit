@@ -225,20 +225,22 @@ def run_audit(only_new: bool = True):
                     "reason":  str(e)[:200],
                 }
 
-        # Сохраняем в БД
+        # Сохраняем анализ в БД (tg_sent пока FALSE)
         cur.execute("""
             UPDATE call_transcripts
             SET manager_name = %s,
                 result_type  = %s,
-                summary      = %s,
-                tg_sent      = TRUE
+                summary      = %s
             WHERE id = %s
         """, (row_dict["manager_name"], analysis["result"], analysis["summary"], rid))
         conn.commit()
 
-        # Отправляем в Telegram
+        # Отправляем в Telegram — ставим tg_sent=TRUE только если дошло
         msg = format_tg_message(row_dict, analysis)
         ok  = send_tg(msg)
+        if ok:
+            cur.execute("UPDATE call_transcripts SET tg_sent = TRUE WHERE id = %s", (rid,))
+            conn.commit()
         status = "✓" if ok else "✗ ошибка TG"
         print(f"  ID={rid} {analysis['result']:6} {status} — {subject}")
 
@@ -281,14 +283,17 @@ def run_single(record_id: int):
 
     cur.execute("""
         UPDATE call_transcripts
-        SET manager_name = %s, result_type = %s, summary = %s, tg_sent = TRUE
+        SET manager_name = %s, result_type = %s, summary = %s
         WHERE id = %s
     """, (row_dict["manager_name"], analysis["result"], analysis["summary"], rid))
     conn.commit()
-    conn.close()
 
     msg = format_tg_message(row_dict, analysis)
     ok  = send_tg(msg)
+    if ok:
+        cur.execute("UPDATE call_transcripts SET tg_sent = TRUE WHERE id = %s", (rid,))
+        conn.commit()
+    conn.close()
     print(f"ID={rid} {analysis['result']} {'✓' if ok else '✗ ошибка TG'} — {subject}")
 
 
