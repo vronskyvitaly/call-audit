@@ -1,39 +1,41 @@
-# SEO-агент Royal Cargo
+# call-audit — Аудит звонков Royal Cargo
 
-Автоматическая система мониторинга и анализа телефонных звонков для таможенного брокера **Royal Cargo**.
+Автоматическая система анализа телефонных звонков менеджеров таможенного брокера **Royal Cargo**. Каждый звонок транскрибируется, оценивается AI и отправляется руководителю в Telegram.
 
 ## Что делает
 
-1. **Мониторит** звонки менеджеров в Bitrix24 каждые 10 минут
+1. **Мониторит** звонки менеджеров в Bitrix24 через webhook + polling каждые 3 минуты
 2. **Скачивает** MP3-записи разговоров
 3. **Транскрибирует** аудио через Groq Whisper (~1 сек на файл)
-4. **Сохраняет** расшифровку в базу данных PostgreSQL
+4. **Сохраняет** расшифровку в PostgreSQL
 5. **Анализирует** качество разговора через Claude AI
-6. **Отправляет** отчёт руководителю в Telegram с оценкой 🟢 / 🟡 / 🔴
+6. **Отправляет** отчёт руководителю в Telegram с оценкой 🟢 / 🟡 / 🔴, полной расшифровкой и ссылкой на лид
 
 ## Архитектура
 
 ```
-Bitrix24 (звонки)
+Bitrix24 (звонок завершён)
       │
-      ▼
-watcher.py  ──── polling каждые 10 мин ────▶  Groq Whisper
-(Flask, Coolify)                                    │
-      │                                         транскрипт
-      │                                             │
-      ▼                                             ▼
-PostgreSQL (call_transcripts) ◀─────────────────────┘
-      │
-      ▼
-audit.py  ──── Claude AI ────▶  Telegram (руководителю)
-(cron, каждые 10 мин)
+      ├── webhook ONVOXIMPLANTCALLEND ──▶ watcher.py
+      └── polling каждые 3 мин ──────────▶ watcher.py
+                                               │
+                                          Groq Whisper
+                                               │
+                                          PostgreSQL (call_transcripts)
+                                               │
+                                          audit.py --id <N>
+                                               │
+                                          Claude AI (оценка + резюме)
+                                               │
+                                          Telegram @ROYALAGENT011_bot
+                                          (руководителю + разработчику)
 ```
 
-**watcher.py** — Flask-сервер, задеплоен на Coolify. Polling каждые 10 минут опрашивает 4 cargo-менеджеров и входящие необработанные лиды. Webhook `/webhook` принимает события Bitrix24 как резервный канал.
+**watcher.py** — Flask-сервер на Coolify. Принимает webhook от Bitrix24, скачивает запись, транскрибирует и сразу запускает `audit.py` для конкретной записи.
 
-**audit.py** — читает новые записи из БД (`tg_sent=FALSE`), отправляет расшифровку в Claude, получает оценку разговора и краткое резюме, шлёт отчёт в Telegram.
+**audit.py** — анализирует расшифровку через Claude, определяет оценку разговора (🟢/🟡/🔴), формирует и отправляет отчёт в Telegram с полной расшифровкой.
 
-**check_db.py** — email-уведомления о новых расшифровках (cron, пн-пт 9-18 МСК).
+**check_db.py** — email-уведомления о новых расшифровках (cron пн-пт 9-18 МСК).
 
 ## Стек
 
@@ -44,7 +46,7 @@ audit.py  ──── Claude AI ────▶  Telegram (руководите
 | CRM | Bitrix24 REST API |
 | База данных | PostgreSQL (psycopg2) |
 | Сервер | Flask + Coolify (Docker) |
-| Уведомления | Telegram Bot API |
+| Уведомления | Telegram Bot API (`@ROYALAGENT011_bot`) |
 
 ## Деплой
 
@@ -56,13 +58,22 @@ curl https://agentseven.tamozhennybrokeragents.ru/health
 
 # Запустить polling вручную
 curl https://agentseven.tamozhennybrokeragents.ru/poll
+
+# Запустить аудит вручную (все непросмотренные)
+python3 audit.py
+
+# Запустить аудит конкретной записи
+python3 audit.py --id 42
+
+# Переотправить все 23 записи
+python3 audit.py --all
 ```
 
 Деплой происходит автоматически при `git push` в `main`.
 
 ## Переменные окружения
 
-Все секреты хранятся в `.env` (не коммитится). Необходимые переменные:
+Все секреты хранятся в `.env` (не коммитится):
 
 ```
 BITRIX_PORTAL, BITRIX_USER_ID, BITRIX_TOKEN
@@ -73,12 +84,3 @@ TG_BOT_TOKEN_AUDIT
 BITRIX_WEBHOOK_TOKEN
 BITRIX_ID_* (ID менеджеров)
 ```
-
-## Roadmap
-
-- [x] Polling Bitrix24 + транскрипция звонков
-- [x] Аудит качества через Claude → Telegram
-- [ ] Генерация SEO-статей на основе транскриптов
-- [ ] Согласование статей через Telegram
-- [ ] Публикация в CMS
-- [ ] Видео из статьи → соцсети
