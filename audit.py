@@ -55,6 +55,7 @@ def analyze_call(transcript: str, subject: str) -> dict:
 
 Верни ТОЛЬКО валидный JSON без markdown-блоков:
 {{
+  "manager_name": "имя менеджера из текста (только имя, например 'Екатерина'). Если не определить — null",
   "result": "green" или "yellow" или "red",
   "summary": "краткое резюме (1-2 предложения)",
   "reason": "почему такая оценка"
@@ -225,6 +226,10 @@ def run_audit(only_new: bool = True):
                     "reason":  str(e)[:200],
                 }
 
+        # Имя из Claude приоритетнее чем из subject
+        manager_name = analysis.get("manager_name") or row_dict["manager_name"]
+        row_dict["manager_name"] = manager_name
+
         # Сохраняем анализ в БД (tg_sent пока FALSE)
         cur.execute("""
             UPDATE call_transcripts
@@ -232,7 +237,7 @@ def run_audit(only_new: bool = True):
                 result_type  = %s,
                 summary      = %s
             WHERE id = %s
-        """, (row_dict["manager_name"], analysis["result"], analysis["summary"], rid))
+        """, (manager_name, analysis["result"], analysis["summary"], rid))
         conn.commit()
 
         # Отправляем в Telegram — ставим tg_sent=TRUE только если дошло
@@ -281,11 +286,14 @@ def run_single(record_id: int):
         except Exception as e:
             analysis = {"result": "yellow", "summary": "Ошибка анализа.", "reason": str(e)[:200]}
 
+    manager_name = analysis.get("manager_name") or row_dict["manager_name"]
+    row_dict["manager_name"] = manager_name
+
     cur.execute("""
         UPDATE call_transcripts
         SET manager_name = %s, result_type = %s, summary = %s
         WHERE id = %s
-    """, (row_dict["manager_name"], analysis["result"], analysis["summary"], rid))
+    """, (manager_name, analysis["result"], analysis["summary"], rid))
     conn.commit()
 
     msg = format_tg_message(row_dict, analysis)
