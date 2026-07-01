@@ -13,7 +13,7 @@ DB_URL       = os.getenv("Postgres_URL") or "postgres://postgres:trLNB8TjhnFqZwO
 SMTP_HOST    = "smtp.yandex.ru"
 SMTP_PORT    = 465
 SMTP_USER    = "office@tamozhennyy.broker"
-SMTP_PASS    = "dtfluobocgfxffde"
+SMTP_PASS    = "rjdzrmhxdueixfuk"
 TO_EMAIL     = "vronskyvitaly@mail.ru"
 LAST_ID_FILE = "/app/check_db_last_id.txt"
 
