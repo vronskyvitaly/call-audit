@@ -37,6 +37,33 @@ CARGO_MANAGERS = {
     "Михалина":  int(os.getenv("BITRIX_ID_EKATERINA_MIKHALINA", 51)),
 }
 
+# Карта добавочных номеров → Имя Фамилия (из .env)
+EXTENSION_TO_NAME = {
+    "703": "Мария Батыгина",
+    "704": "Виктория Говорова",
+    "705": "Екатерина Михалина",
+    "706": "Елена Полетаева",
+    "707": "Виктория Никитина",
+    "700": "Дмитрий Каменев",
+    "701": "Константин Прокофьев",
+    "702": "Дмитрий Александров",
+    "711": "Виталий Вронский",
+    "200": "Ксения",
+    "101": "Елена Кизявка",
+    "103": "Елизавета Елизарова",
+    "105": "Татьяна Матюшина",
+    "107": "Олеся Лутонина",
+    "108": "Юлия Кирюшина",
+    "109": "Александр Баранов",
+    "111": "Александр Березнев",
+    "116": "Ирина Коростелева",
+    "120": "Наталья Лыкошева",
+    "124": "Людмила Медведева",
+    "222": "Ольга Марилова",
+    "332": "Дмитрий Березнев",
+    "351": "Елизавета Балашова",
+}
+
 
 # ── DB ─────────────────────────────────────────────────────────────────────────
 
@@ -71,15 +98,15 @@ def file_already_saved(file_id):
             return cur.fetchone() is not None
 
 
-def save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript):
+def save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript, manager_name=None):
     lead_url = f"{os.getenv('BITRIX_PORTAL')}/crm/lead/details/{lead_id}/" if lead_id else None
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO call_transcripts
-                    (lead_id, lead_url, bitrix_act_id, file_id, call_date, phone, subject, transcript_raw)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
-            """, (lead_id, lead_url, act_id, file_id, call_date, phone, subject, transcript))
+                    (lead_id, lead_url, bitrix_act_id, file_id, call_date, phone, subject, transcript_raw, manager_name)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            """, (lead_id, lead_url, act_id, file_id, call_date, phone, subject, transcript, manager_name))
             row_id = cur.fetchone()[0]
         conn.commit()
     return row_id
@@ -113,7 +140,7 @@ def transcribe(audio_bytes, filename="call.mp3"):
     return str(result).strip()
 
 
-def process_call(lead_id, act_id, file_id, call_date, phone, subject):
+def process_call(lead_id, act_id, file_id, call_date, phone, subject, manager_name=None):
     """Скачивает, транскрибирует и сохраняет один звонок."""
     if file_already_saved(file_id):
         return
@@ -127,8 +154,8 @@ def process_call(lead_id, act_id, file_id, call_date, phone, subject):
     transcript = transcribe(audio, f"{file_id}.mp3")
     log.info(f"fileID={file_id}: {len(audio)//1024}KB → {len(transcript)} символов за {time.time()-t0:.1f}с")
 
-    row_id = save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript)
-    log.info(f"Сохранено в БД id={row_id} | Лид #{lead_id} | {call_date}")
+    row_id = save_transcript(lead_id, act_id, file_id, call_date, phone, subject, transcript, manager_name)
+    log.info(f"Сохранено в БД id={row_id} | Лид #{lead_id} | {call_date} | Менеджер: {manager_name or '—'}")
 
     # Запускаем аудит конкретной записи в фоне (audit.py лежит рядом)
     audit_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit.py")
@@ -223,7 +250,7 @@ def polling_loop():
         time.sleep(180)  # 3 минуты
 
 
-def process_call_by_lead(lead_id: str, phone: str = ""):
+def process_call_by_lead(lead_id: str, phone: str = "", manager_name: str = None):
     """Найти последний звонок с записью в лиде и обработать его."""
     acts = bitrix("crm.activity.list", {
         "FILTER[OWNER_TYPE_ID]": 1, "FILTER[OWNER_ID]": lead_id, "FILTER[TYPE_ID]": 2,
@@ -240,7 +267,7 @@ def process_call_by_lead(lead_id: str, phone: str = ""):
                     phone = c.get("VALUE", "")
                     break
             process_call(lead_id, act["ID"], act["FILES"][0]["id"],
-                         act.get("START_TIME"), phone, act.get("SUBJECT", ""))
+                         act.get("START_TIME"), phone, act.get("SUBJECT", ""), manager_name)
             return
     log.warning(f"process_call_by_lead {lead_id}: звонков с записью не найдено")
 
@@ -309,27 +336,22 @@ def novofon_webhook():
     data = request.json or request.form.to_dict()
     log.info(f"Новофон webhook: {data}")
 
-    phone = (
-        data.get("contact_phone_number")
-        or data.get("communication_number")
-        or ""
-    )
-    ext = data.get("communication_number", "")  # внутренний номер (доб.)
+    phone = data.get("contact_phone_number", "")
+    ext   = str(data.get("communication_number", "")).strip()
 
     if not phone:
-        log.warning("Новофон: нет номера телефона в теле запроса")
+        log.warning("Новофон: нет contact_phone_number в теле запроса")
         return jsonify({"ok": False, "error": "no phone"}), 400
 
-    # Нормализуем номер: убираем пробелы и + для поиска в Bitrix24
+    # Определяем имя менеджера по добавочному номеру
+    manager_name = EXTENSION_TO_NAME.get(ext)
+    log.info(f"Новофон: звонок завершён. Клиент={phone}, доб.={ext} → {manager_name or 'неизвестен'}")
+
     phone_clean = phone.replace(" ", "").replace("-", "")
 
-    log.info(f"Новофон: звонок завершён. Клиент={phone_clean}, доб.={ext}")
-
     def find_and_process():
-        # Ждём пока Bitrix24 обработает запись (~30 сек)
         time.sleep(30)
         try:
-            # Ищем лид по номеру телефона
             leads = bitrix("crm.lead.list", {
                 "FILTER[PHONE]": phone_clean,
                 "SELECT[]": ["ID"],
@@ -338,8 +360,8 @@ def novofon_webhook():
             })
             if isinstance(leads, list) and leads:
                 lead_id = leads[0]["ID"]
-                log.info(f"Новофон: найден лид {lead_id} по телефону {phone_clean}")
-                process_call_by_lead(str(lead_id), phone_clean)
+                log.info(f"Новофон: лид {lead_id} по телефону {phone_clean}, менеджер={manager_name}")
+                process_call_by_lead(str(lead_id), phone_clean, manager_name)
             else:
                 log.warning(f"Новофон: лид по телефону {phone_clean} не найден")
         except Exception as e:

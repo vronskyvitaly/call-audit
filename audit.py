@@ -163,14 +163,14 @@ def run_audit(only_new: bool = True):
 
     if only_new:
         cur.execute("""
-            SELECT id, lead_id, lead_url, phone, call_date, subject, transcript_raw
+            SELECT id, lead_id, lead_url, phone, call_date, subject, transcript_raw, manager_name
             FROM call_transcripts
             WHERE tg_sent = FALSE OR tg_sent IS NULL
             ORDER BY id ASC
         """)
     else:
         cur.execute("""
-            SELECT id, lead_id, lead_url, phone, call_date, subject, transcript_raw
+            SELECT id, lead_id, lead_url, phone, call_date, subject, transcript_raw, manager_name
             FROM call_transcripts
             ORDER BY id ASC
         """)
@@ -194,7 +194,7 @@ def run_audit(only_new: bool = True):
     time.sleep(1)
 
     for r in rows:
-        rid, lead_id, lead_url, phone, call_date, subject, transcript = r
+        rid, lead_id, lead_url, phone, call_date, subject, transcript, db_manager = r
 
         row_dict = {
             "id": rid,
@@ -203,7 +203,7 @@ def run_audit(only_new: bool = True):
             "phone": phone,
             "call_date": call_date,
             "subject": subject,
-            "manager_name": extract_manager(subject),
+            "manager_name": db_manager or extract_manager(subject),
             "transcript_raw": transcript,
         }
 
@@ -226,8 +226,8 @@ def run_audit(only_new: bool = True):
                     "reason":  str(e)[:200],
                 }
 
-        # Имя из Claude приоритетнее чем из subject
-        manager_name = analysis.get("manager_name") or row_dict["manager_name"]
+        # Приоритет: Новофон (db_manager) > Claude > subject
+        manager_name = db_manager or analysis.get("manager_name") or row_dict["manager_name"]
         row_dict["manager_name"] = manager_name
 
         # Сохраняем анализ в БД (tg_sent пока FALSE)
@@ -260,7 +260,7 @@ def run_single(record_id: int):
     conn = get_db()
     cur  = conn.cursor()
     cur.execute("""
-        SELECT id, lead_id, lead_url, phone, call_date, subject, transcript_raw
+        SELECT id, lead_id, lead_url, phone, call_date, subject, transcript_raw, manager_name
         FROM call_transcripts WHERE id = %s
     """, (record_id,))
     row = cur.fetchone()
@@ -269,11 +269,11 @@ def run_single(record_id: int):
         conn.close()
         return
 
-    rid, lead_id, lead_url, phone, call_date, subject, transcript = row
+    rid, lead_id, lead_url, phone, call_date, subject, transcript, db_manager = row
     row_dict = {
         "id": rid, "lead_id": lead_id, "lead_url": lead_url,
         "phone": phone, "call_date": call_date, "subject": subject,
-        "manager_name": extract_manager(subject),
+        "manager_name": db_manager or extract_manager(subject),
         "transcript_raw": transcript,
     }
 
@@ -286,7 +286,8 @@ def run_single(record_id: int):
         except Exception as e:
             analysis = {"result": "yellow", "summary": "Ошибка анализа.", "reason": str(e)[:200]}
 
-    manager_name = analysis.get("manager_name") or row_dict["manager_name"]
+    # Приоритет: Новофон (db_manager) > Claude > subject
+    manager_name = db_manager or analysis.get("manager_name") or row_dict["manager_name"]
     row_dict["manager_name"] = manager_name
 
     cur.execute("""
