@@ -343,15 +343,28 @@ def novofon_webhook():
             data = {}
     log.info(f"Новофон webhook: {data}")
 
-    phone = data.get("contact_phone_number", "")
-    ext   = str(data.get("communication_number", "")).strip()
+    # Новофон шлёт вложенный JSON: телефон и доб. внутри contact_info
+    contact = data.get("contact_info") or {}
+    employee = data.get("employee_info") or {}
+    call_info = data.get("call_info") or {}
+
+    phone = contact.get("contact_phone_number") or data.get("contact_phone_number", "")
+    ext   = str(contact.get("communication_number") or data.get("communication_number") or "").strip()
+
+    # Пропускаем переадресации без разговора (nobody talked)
+    if call_info.get("talk_time_duration") == 0 and call_info.get("scenario_name") == "переадресация":
+        log.info(f"Новофон: пропускаем переадресацию без разговора (phone={phone})")
+        return jsonify({"ok": True, "skipped": "redirect_no_talk"})
 
     if not phone:
-        log.warning("Новофон: нет contact_phone_number в теле запроса")
-        return jsonify({"ok": False, "error": "no phone"}), 400
+        log.warning(f"Новофон: нет телефона в данных: {data}")
+        return jsonify({"ok": True, "skipped": "no_phone"})
 
-    # Определяем имя менеджера по добавочному номеру
-    manager_name = EXTENSION_TO_NAME.get(ext)
+    # Имя менеджера: сначала из employee_info, потом из добавочного номера
+    manager_name = (
+        employee.get("employee_full_name")
+        or EXTENSION_TO_NAME.get(ext)
+    )
     log.info(f"Новофон: звонок завершён. Клиент={phone}, доб.={ext} → {manager_name or 'неизвестен'}")
 
     phone_clean = phone.replace(" ", "").replace("-", "")
