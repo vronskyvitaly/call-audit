@@ -303,6 +303,52 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/novofon", methods=["GET", "POST"])
+def novofon_webhook():
+    """Новофон: HTTP-уведомление о завершении звонка."""
+    data = request.json or request.form.to_dict()
+    log.info(f"Новофон webhook: {data}")
+
+    phone = (
+        data.get("contact_phone_number")
+        or data.get("communication_number")
+        or ""
+    )
+    ext = data.get("communication_number", "")  # внутренний номер (доб.)
+
+    if not phone:
+        log.warning("Новофон: нет номера телефона в теле запроса")
+        return jsonify({"ok": False, "error": "no phone"}), 400
+
+    # Нормализуем номер: убираем пробелы и + для поиска в Bitrix24
+    phone_clean = phone.replace(" ", "").replace("-", "")
+
+    log.info(f"Новофон: звонок завершён. Клиент={phone_clean}, доб.={ext}")
+
+    def find_and_process():
+        # Ждём пока Bitrix24 обработает запись (~30 сек)
+        time.sleep(30)
+        try:
+            # Ищем лид по номеру телефона
+            leads = bitrix("crm.lead.list", {
+                "FILTER[PHONE]": phone_clean,
+                "SELECT[]": ["ID"],
+                "ORDER[ID]": "DESC",
+                "LIMIT": 3,
+            })
+            if isinstance(leads, list) and leads:
+                lead_id = leads[0]["ID"]
+                log.info(f"Новофон: найден лид {lead_id} по телефону {phone_clean}")
+                process_call_by_lead(str(lead_id), phone_clean)
+            else:
+                log.warning(f"Новофон: лид по телефону {phone_clean} не найден")
+        except Exception as e:
+            log.error(f"Новофон find_and_process ошибка: {e}")
+
+    threading.Thread(target=find_and_process, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @app.route("/process-lead", methods=["GET", "POST"])
 def process_lead_endpoint():
     """Ручная обработка конкретного лида: /process-lead?lead_id=7771"""
