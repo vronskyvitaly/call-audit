@@ -5,3 +5,6 @@ __pycache__/
 *.claude
 PROJECT_TASKS.md
 *PROJECT_TASKS.mdPROJECT_TASKS.md
+
+env_images/*
+env_images
