@@ -55,7 +55,6 @@ def analyze_call(transcript: str, subject: str) -> dict:
 
 Верни ТОЛЬКО валидный JSON без markdown-блоков:
 {{
-  "manager_name": "имя менеджера из текста (только имя, например 'Екатерина'). Если не определить — null",
   "result": "green" или "yellow" или "red",
   "summary": "краткое резюме (1-2 предложения)",
   "reason": "почему такая оценка"
@@ -226,8 +225,8 @@ def run_audit(only_new: bool = True):
                     "reason":  str(e)[:200],
                 }
 
-        # Приоритет: Новофон (db_manager) > Claude > subject
-        manager_name = db_manager or analysis.get("manager_name") or row_dict["manager_name"]
+        # Приоритет: Новофон (db_manager из extension) > subject — Claude не угадывает имена
+        manager_name = db_manager or row_dict["manager_name"]
         row_dict["manager_name"] = manager_name
 
         # Сохраняем анализ в БД (tg_sent пока FALSE)
@@ -286,8 +285,8 @@ def run_single(record_id: int):
         except Exception as e:
             analysis = {"result": "yellow", "summary": "Ошибка анализа.", "reason": str(e)[:200]}
 
-    # Приоритет: Новофон (db_manager) > Claude > subject
-    manager_name = db_manager or analysis.get("manager_name") or row_dict["manager_name"]
+    # Приоритет: Новофон (db_manager из extension) > subject — Claude не угадывает имена
+    manager_name = db_manager or row_dict["manager_name"]
     row_dict["manager_name"] = manager_name
 
     cur.execute("""

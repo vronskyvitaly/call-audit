@@ -382,6 +382,22 @@ def novofon_webhook():
             if isinstance(leads, list) and leads:
                 lead_id = leads[0]["ID"]
                 log.info(f"Новофон: лид {lead_id} по телефону {phone_clean}, менеджер={manager_name}")
+                # Если знаем менеджера из extension — обновляем все недавние записи с этим телефоном
+                if manager_name:
+                    try:
+                        with get_db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("""
+                                    UPDATE call_transcripts
+                                    SET manager_name = %s
+                                    WHERE phone = %s
+                                      AND manager_name IS NULL
+                                      AND created_at > NOW() - INTERVAL '2 hours'
+                                """, (manager_name, phone_clean))
+                            conn.commit()
+                        log.info(f"Новофон: обновлён менеджер={manager_name} для тел.{phone_clean}")
+                    except Exception as e:
+                        log.warning(f"Новофон: не удалось обновить менеджера: {e}")
                 process_call_by_lead(str(lead_id), phone_clean, manager_name)
             else:
                 log.warning(f"Новофон: лид по телефону {phone_clean} не найден")
